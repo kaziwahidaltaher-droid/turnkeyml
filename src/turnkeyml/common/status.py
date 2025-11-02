@@ -1,18 +1,16 @@
 import os
-import platform
-import shutil
 import sys
 import math
+from enum import Enum
 import dataclasses
+import platform
 from typing import Callable, List, Union, Dict, Optional
-import textwrap
-import psutil
 import torch
 from turnkeyml.common import printing
-from turnkeyml.state import State
 import turnkeyml.common.build as build
+from turnkeyml.common.performance import MeasuredPerformance
 import turnkeyml.common.filesystem as fs
-import turnkeyml.common.analyze_model as analyze_model
+import turnkeyml.analyze.model as analyze_model
 
 
 def _pretty_print_key(key: str) -> str:
@@ -20,11 +18,6 @@ def _pretty_print_key(key: str) -> str:
     result = [word.capitalize() for word in result]
     result = " ".join(result)
     return result
-
-
-class PrettyFloat(float):
-    def __repr__(self):
-        return f"{self:0.3f}"
 
 
 def parameters_to_size(parameters: int, byte_per_parameter: int = 4) -> str:
@@ -38,6 +31,12 @@ def parameters_to_size(parameters: int, byte_per_parameter: int = 4) -> str:
     return "%s %s" % (s, size_name[i])
 
 
+class Verbosity(Enum):
+    AUTO = "auto"
+    DYNAMIC = "dynamic"
+    STATIC = "static"
+
+
 @dataclasses.dataclass
 class BasicInfo:
     name: str
@@ -47,6 +46,8 @@ class BasicInfo:
     params: int = 0
     depth: int = 0
     parent_hash: Union[str, None] = None
+    build_model: bool = False
+    model_type: build.ModelType = build.ModelType.PYTORCH
     model_class: type = None
     # This is the "model hash", not to be confused with the
     # "invocation hash"
@@ -64,6 +65,7 @@ class SkipFields:
 
     file_name: bool = False
     model_name: bool = False
+    model_type: bool = False
     parameters: bool = False
     location: bool = False
     input_shape: bool = False
@@ -80,20 +82,19 @@ class UniqueInvocationInfo(BasicInfo):
     """
 
     invocation_hash: Union[str, None] = None
+    performance: MeasuredPerformance = None
     traceback: List[str] = None
     inputs: Union[dict, None] = None
     input_shapes: Union[dict, None] = None
     executed: int = 0
     exec_time: float = 0.0
     status_message: str = ""
-    extra_status: Optional[str] = ""
     is_target: bool = False
-    auto_selected: bool = False
     status_message_color: printing.Colors = printing.Colors.ENDC
     traceback_message_color: printing.Colors = printing.Colors.FAIL
-    stats_keys: List[str] = dataclasses.field(default_factory=list)
-    forward_function_pointer: callable = None
-    original_forward_function: callable = None
+    stats_keys: Optional[List[str]] = None
+    stats: fs.Stats = None
+
     # Fields specific to printing status
     skip: SkipFields = None
     extension: str = None
@@ -115,13 +116,8 @@ class UniqueInvocationInfo(BasicInfo):
         if print_file_name:
             print(f"{self.script_name}{self.extension}:")
 
-        # Print invocation about the model (only applies to scripts, not ONNX files or
-        # LLMs, which have no extension)
-        if not (
-            self.extension == ".onnx"
-            or self.extension == build.state_file_name
-            or self.extension == ""
-        ):
+        # Print invocation about the model (only applies to scripts, not ONNX files)
+        if self.model_type != build.ModelType.ONNX_FILE:
             if self.depth == 0 and multiple_unique_invocations:
                 if not model_visited:
                     printing.logn(f"{self.indent}{self.name}")
@@ -135,20 +131,30 @@ class UniqueInvocationInfo(BasicInfo):
         self.skip.file_name = True
         self.skip.model_name = True
 
-    def _print_location(self):
-        if self.skip.location or self.file == "":
+    def _print_model_type(self):
+        if self.skip.model_type:
             return
 
         if self.depth == 0:
-            print(f"{self.indent}\tLocation:\t{self.file}", end="")
-            if self.extension == ".onnx":
-                print()
-            else:
-                print(f", line {self.line}")
+            if self.model_type == build.ModelType.PYTORCH:
+                print(f"{self.indent}\tModel Type:\tPytorch (torch.nn.Module)")
+            elif self.model_type == build.ModelType.KERAS:
+                print(f"{self.indent}\tModel Type:\tKeras (tf.keras.Model)")
+            elif self.model_type == build.ModelType.ONNX_FILE:
+                print(f"{self.indent}\tModel Type:\tONNX File (.onnx)")
+
+        self.skip.model_type = True
+
+    def _print_location(self):
+        if self.skip.location:
+            return
+
+        if self.depth == 0:
+            print(f"{self.indent}\tLocation:\t{self.file}, line {self.line}")
             self.skip.location = True
 
     def _print_parameters(self):
-        if self.skip.parameters or self.params is None:
+        if self.skip.parameters:
             return
 
         # Display number of parameters and size
@@ -178,7 +184,7 @@ class UniqueInvocationInfo(BasicInfo):
         self.skip.unique_input_shape = True
 
     def _print_input_shape(self):
-        if self.skip.input_shape or self.input_shapes is None:
+        if self.skip.input_shape:
             return
 
         # Prepare input shape to be printed
@@ -191,22 +197,14 @@ class UniqueInvocationInfo(BasicInfo):
         self.skip.input_shape = True
 
     def _print_build_dir(self, cache_dir: str, build_name: str):
-        if self.skip.build_dir or not self.is_target:
+        if self.skip.build_dir:
             return
 
-        print(f"{self.indent}\tBuild dir:\t{build.output_dir(cache_dir, build_name)}")
+        print(f"{self.indent}\tBuild dir:\t {build.output_dir(cache_dir, build_name)}")
 
         self.skip.build_dir = True
 
-    def _print_peak_memory(self):
-        if platform.system() == "Windows":
-            print(
-                f"{self.indent}\tPeak memory:\t"
-                f"{psutil.Process().memory_info().peak_wset / 1024**3:,.3f} GB"
-            )
-
-    def _print_status(self, cache_dir: str, build_name: str):
-        stats = fs.Stats(cache_dir, build_name)
+    def _print_status(self):
         if self.skip.previous_status_message:
             if self.skip.previous_status_message == self.status_message:
                 # This is a special case for skipping: we only want to skip
@@ -217,102 +215,57 @@ class UniqueInvocationInfo(BasicInfo):
                 # Print some whitespace to help the status stand out
                 print()
 
-        printing.log(f"{self.indent}\tStatus:\t\t")
-        printing.logn(
-            f"{self.status_message}",
-            c=self.status_message_color,
-        )
-        if self.is_target:
+        # Print turnkey results if turnkey was run
+        if self.performance:
+            printing.log(f"{self.indent}\tStatus:\t\t")
+            printing.logn(
+                f"Successfully benchmarked on {self.performance.device} "
+                f"({self.performance.runtime} "
+                f"v{self.performance.runtime_version}) ",
+                c=self.status_message_color,
+            )
+            printing.logn(
+                f"{self.indent}\t\t\tMean Latency:\t{self.performance.mean_latency:.3f}"
+                f"\t{self.performance.latency_units}"
+            )
+            printing.logn(
+                f"{self.indent}\t\t\tThroughput:\t{self.performance.throughput:.1f}"
+                f"\t{self.performance.throughput_units}"
+            )
 
-            # Get the maximum key length to figure out the number
-            # of tabs needed to align the values
-            max_key_len = 0
-            for key in self.stats_keys:
-                max_key_len = max(len(_pretty_print_key(key)), max_key_len)
+            if self.stats_keys is not None:
+                for key in self.stats_keys:
+                    nice_key = _pretty_print_key(key)
+                    try:
+                        value = self.stats.evaluation_stats[key]
+                        printing.logn(f"{self.indent}\t\t\t{nice_key}:\t{value}")
+                    except KeyError:
+                        # Ignore any keys that are missing because that means the
+                        # evaluation did not produce them
+                        pass
+            print()
+        else:
+            if self.is_target and self.build_model:
+                printing.log(f"{self.indent}\tStatus:\t\t")
+                printing.logn(
+                    f"{self.status_message}",
+                    c=self.status_message_color,
+                )
 
-            screen_width = shutil.get_terminal_size().columns
-            wrap_screen_width = screen_width - 2
+                if self.traceback is not None:
+                    if os.environ.get("TURNKEY_TRACEBACK") != "False":
+                        for line in self.traceback:
+                            for subline in line.split("\n")[:-1]:
+                                print(f"{self.indent}\t{subline}")
 
-            for key in self.stats_keys:
-                nice_key = _pretty_print_key(key)
-                try:
-                    value = stats.stats[key]
-                    if isinstance(value, float):
-                        value = PrettyFloat(value)
-                    elif isinstance(value, list):
-                        value = [
-                            PrettyFloat(v) if isinstance(v, float) else v for v in value
-                        ]
-                    # Tools may provide a unit of measurement for their status
-                    # stats, whose key name should follow the format
-                    # "STATUS_STATS_KEY_units"
-                    units_key = key + "_units"
-                    units = stats.stats.get(units_key)
-                    units = units if units is not None else ""
-                    if self.extension == "":
-                        value_tabs = " " * (
-                            (max_key_len - len(_pretty_print_key(key))) + 1
-                        )
-                        hanging_indent = (
-                            len(self.indent) + 8 + len(nice_key) + 1 + len(value_tabs)
-                        )
-                        hanging_indent_str = " " * hanging_indent
-                        if (
-                            isinstance(value, list)
-                            and len(value) > 0
-                            and all(isinstance(item, str) for item in value)
-                        ):
-                            # Value is a list of strings, so output each one starting
-                            # on its own line
-                            printing.logn(f"{self.indent}\t{nice_key}:{value_tabs}[")
-                            for line_counter, text in enumerate(value):
-                                lines = textwrap.wrap(
-                                    "'" + text + "'",
-                                    width=wrap_screen_width,
-                                    initial_indent=hanging_indent_str,
-                                    subsequent_indent=hanging_indent_str,
-                                )
-                                if line_counter + 1 < len(value):
-                                    # Not the last text item in the list, so add a comma
-                                    lines[-1] = lines[-1] + ","
-                                for line in lines:
-                                    printing.logn(line)
-                            printing.logn(f"{' ' * hanging_indent}] {units}")
-                        else:
-                            # Wrap value as needed
-                            status_str = (
-                                f"{self.indent}\t{nice_key}:{value_tabs}{value} {units}"
-                            )
-                            lines = textwrap.wrap(
-                                status_str,
-                                width=wrap_screen_width,
-                                subsequent_indent=hanging_indent_str,
-                            )
-                            for line in lines:
-                                printing.logn(line)
                     else:
                         printing.logn(
-                            f"{self.indent}\t\t\t{nice_key}:\t{value} {units}"
+                            f"{self.indent}\t\t\tTo see the full stack trace, "
+                            "rerun with `export TURNKEY_TRACEBACK=True`.\n",
+                            c=self.status_message_color,
                         )
-                except KeyError:
-                    # Ignore any keys that are missing because that means the
-                    # evaluation did not produce them
-                    pass
-
-            if self.traceback is not None:
-                if os.environ.get("TURNKEY_TRACEBACK") != "False":
-                    for line in self.traceback:
-                        for subline in line.split("\n")[:-1]:
-                            print(f"{self.indent}\t{subline}")
-
                 else:
-                    printing.logn(
-                        f"{self.indent}\t\t\tTo see the full stack trace, "
-                        "rerun with `export TURNKEY_TRACEBACK=True`.\n",
-                        c=self.status_message_color,
-                    )
-            else:
-                print()
+                    print()
 
         self.skip.previous_status_message = self.status_message
 
@@ -329,12 +282,14 @@ class UniqueInvocationInfo(BasicInfo):
         Print information about a given model or submodel.
         """
 
-        if self.extension == ".onnx" or self.extension == "":
+        if self.model_type == build.ModelType.ONNX_FILE:
+            self.extension = ".onnx"
             self.indent = "\t" * (2 * self.depth)
         else:
+            self.extension = ".py"
             self.indent = "\t" * (2 * self.depth + 1)
 
-        if self.exec_time == 0:
+        if self.exec_time == 0 or self.build_model:
             exec_time_formatted = ""
         else:
             exec_time_formatted = f" - {self.exec_time:.2f}s"
@@ -347,6 +302,7 @@ class UniqueInvocationInfo(BasicInfo):
         )
         if (self.depth == 0 and not model_visited) or (self.depth != 0):
             # Print this information only once per model
+            self._print_model_type()
             self._print_location()
             self._print_parameters()
         self._print_unique_input_shape(
@@ -354,8 +310,7 @@ class UniqueInvocationInfo(BasicInfo):
         )
         self._print_input_shape()
         self._print_build_dir(cache_dir=cache_dir, build_name=build_name)
-        self._print_peak_memory()
-        self._print_status(cache_dir=cache_dir, build_name=build_name)
+        self._print_status()
 
         print()
 
@@ -370,7 +325,55 @@ class ModelInfo(BasicInfo):
     last_unique_invocation_executed: Union[str, None] = None
 
     def __post_init__(self):
-        self.params = analyze_model.count_parameters(self.model)
+        self.params = analyze_model.count_parameters(self.model, self.model_type)
+
+
+def update(
+    models_found: Dict[str, ModelInfo],
+    build_name: str,
+    cache_dir: str,
+    invocation_info: UniqueInvocationInfo,
+    verbosity: Verbosity,
+) -> None:
+    """
+    Prints all models and submodels found
+    """
+
+    if verbosity == Verbosity.DYNAMIC:
+        if platform.system() != "Windows":
+            os.system("clear")
+        else:
+            os.system("cls")
+
+        printing.logn(
+            "\nModels discovered during profiling:\n",
+            c=printing.Colors.BOLD,
+        )
+        recursive_print(
+            models_found=models_found,
+            build_name=build_name,
+            cache_dir=cache_dir,
+            parent_model_hash=None,
+            parent_invocation_hash=None,
+            script_names_visited=[],
+        )
+    else:  # Verbosity.STATIC
+        if invocation_info.model_type == build.ModelType.ONNX_FILE:
+            # We don't invoke the ONNX files, so they can't have multiple invocations
+            multiple_unique_invocations = False
+        else:
+            multiple_unique_invocations = (
+                len(models_found[invocation_info.hash].unique_invocations) > 1
+            )
+
+        invocation_info.print(
+            build_name=build_name,
+            cache_dir=cache_dir,
+            print_file_name=True,
+            invocation_idx=0,
+            model_visited=False,
+            multiple_unique_invocations=multiple_unique_invocations,
+        )
 
 
 def recursive_print(
@@ -442,45 +445,3 @@ def stop_logger_forward() -> None:
         sys.stdout = sys.stdout.terminal
     if hasattr(sys.stderr, "terminal_err"):
         sys.stderr = sys.stderr.terminal_err
-
-
-def add_to_state(
-    state: State,
-    name: str,
-    model: Union[str, torch.nn.Module],
-    extension: str = "",
-    input_shapes: Optional[Dict] = None,
-):
-    if vars(state).get("model_hash"):
-        model_hash = state.model_hash
-    else:
-        model_hash = 0
-
-    if os.path.exists(name):
-        file_name = fs.clean_file_name(name)
-        file = name
-    else:
-        file_name = name
-        file = ""
-
-    state.invocation_info = UniqueInvocationInfo(
-        name=input,
-        script_name=file_name,
-        file=file,
-        input_shapes=input_shapes,
-        hash=model_hash,
-        is_target=True,
-        extension=extension,
-        executed=1,
-    )
-    state.models_found = {
-        "the_model": ModelInfo(
-            model=model,
-            name=input,
-            script_name=input,
-            file=input,
-            unique_invocations={model_hash: state.invocation_info},
-            hash=model_hash,
-        )
-    }
-    state.invocation_info.params = state.models_found["the_model"].params

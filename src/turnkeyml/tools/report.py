@@ -47,8 +47,6 @@ class Report(ManagementTool):
 
     @staticmethod
     def parser(add_help: bool = True) -> argparse.ArgumentParser:
-        parser = __class__.helpful_parser(
-            short_description="Export statistics from each turnkey run to a CSV file",
             add_help=add_help,
         )
 
@@ -58,7 +56,6 @@ class Report(ManagementTool):
             nargs="*",
             default=[fs.DEFAULT_CACHE_DIR],
             help=(
-                "One or more turnkey cache directories to use to generate the report "
                 f"(defaults to {fs.DEFAULT_CACHE_DIR})"
             ),
         )

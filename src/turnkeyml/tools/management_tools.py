@@ -4,10 +4,7 @@ from typing import List
 import turnkeyml.common.filesystem as fs
 import turnkeyml.common.exceptions as exp
 import turnkeyml.common.printing as printing
-from turnkeyml.tools.tool import ToolParser
 from turnkeyml.version import __version__ as turnkey_version
-from turnkeyml.common.system_info import get_system_info_dict
-from turnkeyml.common.build import output_dir
 
 
 class ManagementTool(abc.ABC):
@@ -17,21 +14,6 @@ class ManagementTool(abc.ABC):
     """
 
     unique_name: str
-
-    @classmethod
-    def helpful_parser(cls, short_description: str, **kwargs):
-        epilog = (
-            f"`{cls.unique_name}` is a Management Tool. It is intended to be invoked by itself "
-            "(i.e., not as part of a sequence), to accomplish a utility function. "
-        )
-
-        return ToolParser(
-            prog=f"turnkey {cls.unique_name}",
-            short_description=short_description,
-            description=cls.__doc__,
-            epilog=epilog,
-            **kwargs,
-        )
 
     @staticmethod
     @abc.abstractmethod
@@ -88,8 +70,6 @@ class Version(ManagementTool):
 
     @staticmethod
     def parser(add_help: bool = True) -> argparse.ArgumentParser:
-        parser = __class__.helpful_parser(
-            short_description="Print the turnkeyml version number",
             add_help=add_help,
         )
 
@@ -100,11 +80,6 @@ class Version(ManagementTool):
 
 
 class Cache(ManagementTool):
-    # pylint: disable=pointless-statement,f-string-without-interpolation
-    f"""
-    A set of functions for managing the turnkey build cache. The default
-    cache location is {fs.DEFAULT_CACHE_DIR}, and can also be selected with
-    the global --cache-dir option or the TURNKEY_CACHE_DIR environment variable.
 
     Users must set either "--all" or "--build-names" to let the tool
     know what builds to operate on.
@@ -121,8 +96,6 @@ class Cache(ManagementTool):
         # NOTE: `--cache-dir` is set as a global input to the turnkey CLI and
         # passed directly to the `run()` method
 
-        parser = __class__.helpful_parser(
-            short_description="Manage the build cache " f"",
             add_help=add_help,
         )
 
@@ -208,7 +181,6 @@ class Cache(ManagementTool):
             printing.log_warning("No builds found.")
 
         for build in builds:
-            build_path = output_dir(cache_dir, build_name=build)
             if fs.is_build_dir(cache_dir, build):
                 # Run actions on the build
                 # These actions are intended to be mutually exclusive, so we
@@ -235,20 +207,12 @@ class Cache(ManagementTool):
 
 class ModelsLocation(ManagementTool):
     """
-    Prints the location of the turnkeyml built in models corpora.
-
-    This is especially useful for when turnkey was installed from PyPI
-    with `pip install turnkeyml`. Example usage in this context:
-        models=$(turnkey models-location --quiet)
-        turnkey -i $models/selftest/linear.py discover export-pytorch
     """
 
     unique_name = "models-location"
 
     @staticmethod
     def parser(add_help: bool = True) -> argparse.ArgumentParser:
-        parser = __class__.helpful_parser(
-            short_description="Print the location of the built-in turnkeyml models",
             add_help=add_help,
         )
 
@@ -256,7 +220,6 @@ class ModelsLocation(ManagementTool):
             "-q",
             "--quiet",
             action="store_true",
-            help="Print only the file path, with no other text",
         )
 
         return parser
@@ -266,37 +229,3 @@ class ModelsLocation(ManagementTool):
             print(fs.MODELS_DIR)
         else:
             printing.log_info(f"The models directory is: {fs.MODELS_DIR}")
-
-
-class SystemInfo(ManagementTool):
-    """
-    Prints system information for the turnkeyml installation.
-    """
-
-    unique_name = "system-info"
-
-    @staticmethod
-    def parser(add_help: bool = True) -> argparse.ArgumentParser:
-        parser = __class__.helpful_parser(
-            short_description="Print system information",
-            add_help=add_help,
-        )
-
-        return parser
-
-    @staticmethod
-    def pretty_print(my_dict: dict, level=0):
-        for k, v in my_dict.items():
-            if isinstance(v, dict):
-                print("    " * level + f"{k}:")
-                SystemInfo.pretty_print(v, level + 1)
-            elif isinstance(v, list):
-                print("    " * level + f"{k}:")
-                for item in v:
-                    print("    " * (level + 1) + f"{item}")
-            else:
-                print("    " * level + f"{k}: {v}")
-
-    def run(self, _):
-        system_info_dict = get_system_info_dict()
-        self.pretty_print(system_info_dict)

@@ -3,10 +3,7 @@ import sys
 import time
 import os
 import argparse
-import textwrap as _textwrap
-import re
 from typing import Tuple, Dict
-from multiprocessing import Process, Queue
 import psutil
 import turnkeyml.common.printing as printing
 import turnkeyml.common.exceptions as exp
@@ -15,29 +12,10 @@ import turnkeyml.common.filesystem as fs
 from turnkeyml.state import State
 
 
-def _spinner(message, q: Queue):
-    """
-    Displays a moving "..." indicator so that the user knows that the
-    Tool is still working. Tools can optionally use a multiprocessing
-    Queue to display the percent progress of the Tool.
-    """
-    percent_complete = None
-    # Get sleep time from environment variable, default to 0.5s if not set
-    try:
-        sleep_time = float(os.getenv("TURNKEY_BUILD_MONITOR_FREQUENCY", "0.5"))
-    except ValueError:
-        sleep_time = 0.5
-
     try:
         parent_process = psutil.Process(pid=os.getppid())
         while parent_process.status() == psutil.STATUS_RUNNING:
             for cursor in ["   ", ".  ", ".. ", "..."]:
-                time.sleep(sleep_time)
-                while not q.empty():
-                    percent_complete = q.get()
-                if percent_complete is not None:
-                    status = f"      {message} ({percent_complete:.1f}%){cursor}\r"
-                else:
                     status = f"      {message}{cursor}         \r"
                 sys.stdout.write(status)
                 sys.stdout.flush()
@@ -75,31 +53,7 @@ def _name_is_file_safe(name: str):
             raise ValueError(msg)
 
 
-class NiceHelpFormatter(argparse.RawDescriptionHelpFormatter):
-    def __add_whitespace(self, idx, amount, text):
-        if idx == 0:
-            return text
-        return (" " * amount) + text
-
-    def _split_lines(self, text, width):
-        textRows = text.splitlines()
-        for idx, line in enumerate(textRows):
-            search = re.search(r"\s*[0-9\-]{0,}\.?\s*", line)
-            if line.strip() == "":
-                textRows[idx] = " "
-            elif search:
-                whitespace_needed = search.end()
-                lines = [
-                    self.__add_whitespace(i, whitespace_needed, x)
-                    for i, x in enumerate(_textwrap.wrap(line, width))
-                ]
-                textRows[idx] = lines
-
-        return [item for sublist in textRows for item in sublist]
-
-
 class ToolParser(argparse.ArgumentParser):
-
     def error(self, message):
         if message.startswith("unrecognized arguments"):
             unrecognized = message.split(": ")[1]
@@ -114,38 +68,19 @@ class ToolParser(argparse.ArgumentParser):
         printing.log_error(message)
         self.exit(2)
 
-    def __init__(
-        self, short_description: str, description: str, prog: str, epilog: str, **kwargs
-    ):
-        super().__init__(
-            description=description,
-            prog=prog,
-            epilog=epilog,
-            formatter_class=NiceHelpFormatter,
-            **kwargs,
-        )
-
-        self.short_description = short_description
-
 
 class Tool(abc.ABC):
 
     unique_name: str
 
     @classmethod
-    def helpful_parser(cls, short_description: str, **kwargs):
         epilog = (
             f"`{cls.unique_name}` is a Tool. It is intended to be invoked as "
             "part of a sequence of Tools, for example: `turnkey -i INPUTS tool-one "
-            "tool-two tool-three`. Tools communicate data to each other via State. "
-            "You can learn more at "
-            "https://github.com/onnx/turnkeyml/blob/main/docs/lemonade/tools_user_guide.md"
         )
 
         return ToolParser(
             prog=f"turnkey {cls.unique_name}",
-            short_description=short_description,
-            description=cls.__doc__,
             epilog=epilog,
             **kwargs,
         )
@@ -163,45 +98,27 @@ class Tool(abc.ABC):
                 success_tick = "+"
                 fail_tick = "x"
 
-            if self.percent_progress is None:
-                progress_indicator = ""
-            else:
-                progress_indicator = f" ({self.percent_progress:.1f}%)"
-
             if successful is None:
                 # Initialize the message
                 printing.logn(f"      {self.monitor_message}   ")
             elif successful:
                 # Print success message
                 printing.log(f"    {success_tick} ", c=printing.Colors.OKGREEN)
-                printing.logn(
-                    self.monitor_message + progress_indicator + "            "
-                )
             else:
                 # successful == False, print failure message
                 printing.log(f"    {fail_tick} ", c=printing.Colors.FAIL)
-                printing.logn(
-                    self.monitor_message + progress_indicator + "            "
-                )
 
     def __init__(
         self,
         monitor_message,
-        enable_logger=True,
     ):
         _name_is_file_safe(self.__class__.unique_name)
 
         self.status_key = f"{fs.Keys.TOOL_STATUS}:{self.__class__.unique_name}"
         self.duration_key = f"{fs.Keys.TOOL_DURATION}:{self.__class__.unique_name}"
-        self.memory_key = f"{fs.Keys.TOOL_MEMORY}:{self.__class__.unique_name}"
         self.monitor_message = monitor_message
         self.progress = None
-        self.progress_queue = None
-        self.percent_progress = None
         self.logfile_path = None
-        # Tools can disable build.Logger, which captures all stdout and stderr from
-        # the Tool, by setting enable_logger=False
-        self.enable_logger = enable_logger
         # Tools can provide a list of keys that can be found in
         # evaluation stats. Those key:value pairs will be presented
         # in the status at the end of the build.
@@ -220,21 +137,6 @@ class Tool(abc.ABC):
         Static method that returns an ArgumentParser that defines the command
         line interface for this Tool.
         """
-
-    def set_percent_progress(self, percent_progress: float):
-        """
-        Update the progress monitor with a percent progress to let the user
-        know how much progress the Tool has made.
-        """
-
-        if percent_progress is not None and not isinstance(percent_progress, float):
-            raise ValueError(
-                f"Input argument must be a float or None, got {percent_progress}"
-            )
-
-        if self.progress_queue:
-            self.progress_queue.put(percent_progress)
-        self.percent_progress = percent_progress
 
     # pylint: disable=unused-argument
     def parse(self, state: State, args, known_only=True) -> argparse.Namespace:
@@ -260,24 +162,13 @@ class Tool(abc.ABC):
 
         return parsed_args
 
-    def parse_and_run(
-        self,
-        state: State,
-        args,
-        monitor: bool = False,
-        known_only=True,
-    ) -> Dict:
         """
         Helper function to parse CLI arguments into the args expected
         by run(), and then forward them into the run() method.
         """
 
         parsed_args = self.parse(state, args, known_only)
-        return self.run_helper(state, monitor, **parsed_args.__dict__)
 
-    def run_helper(
-        self, state: State, monitor: bool = False, **kwargs
-    ) -> Tuple[State, int]:
         """
         Wraps the developer-defined .run() method with helper functionality.
         Specifically:
@@ -297,32 +188,21 @@ class Tool(abc.ABC):
             f"log_{self.unique_name}.txt",
         )
 
-        if monitor:
-            self.progress_queue = Queue()
-            self.progress = Process(
-                target=_spinner, args=(self.monitor_message, self.progress_queue)
-            )
             self.progress.start()
 
         try:
             # Execute the build tool
-
-            if self.enable_logger:
                 with build.Logger(self.monitor_message, self.logfile_path):
                     state = self.run(state, **kwargs)
-            else:
-                state = self.run(state, **kwargs)
 
         except Exception:  # pylint: disable=broad-except
             self.status_line(
                 successful=False,
-                verbosity=monitor,
             )
             state.build_status = build.FunctionStatus.ERROR
             raise
 
         else:
-            self.status_line(successful=True, verbosity=monitor)
 
             # Tools should not set build.FunctionStatus.SUCCESSFUL for the whole build,
             # as that is reserved for Sequence.launch()
@@ -336,35 +216,6 @@ class Tool(abc.ABC):
                 )
 
         finally:
-            if monitor:
                 self.progress.terminate()
 
         return state
-
-
-class FirstTool(Tool):
-    """
-    Provides extra features for Tools that are meant to be the first Tool
-    in the sequence.
-
-    Specifically:
-        - FirstTools should not have any expectations of State.result, since
-            they populate State with an initial result.
-        - All FirstTools implicitly take an `input` argument that points to
-            the input to that Tool, for example an ONNX file or PyTorch script.
-    """
-
-    @classmethod
-    def helpful_parser(cls, short_description: str, **kwargs):
-        parser = super().helpful_parser(short_description, **kwargs)
-
-        # Argument required by TurnkeyML for any tool that starts a sequence
-        parser.add_argument("--input", help=argparse.SUPPRESS)
-
-        return parser
-
-    @abc.abstractmethod
-    def run(self, state: State, input=None) -> State:
-        """
-        The run() method of any FirstTool must accept the `input` argument
-        """

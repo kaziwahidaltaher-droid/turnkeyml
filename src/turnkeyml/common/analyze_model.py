@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import onnx
 from turnkeyml.common import printing
+import turnkeyml.common.build as build
 import turnkeyml.common.filesystem as fs
 
 
@@ -12,13 +13,15 @@ class AnalysisException(Exception):
     """
 
 
-def count_parameters(model: torch.nn.Module) -> int:
+def count_parameters(model: torch.nn.Module, model_type: build.ModelType) -> int:
     """
     Returns the number of parameters of a given model
     """
-    if isinstance(model, (torch.nn.Module, torch.jit.ScriptModule)):
+    if model_type == build.ModelType.PYTORCH:
         return sum([parameter.numel() for _, parameter in model.named_parameters()])
-    elif isinstance(model, str) and model.endswith(".onnx"):
+    elif model_type == build.ModelType.KERAS:
+        return model.count_params()
+    elif model_type == build.ModelType.ONNX_FILE:
         onnx_model = onnx.load(model)
         return int(
             sum(
@@ -27,8 +30,9 @@ def count_parameters(model: torch.nn.Module) -> int:
                 if tensor.name not in onnx_model.graph.input
             )
         )
-    else:
-        return None
+
+    # Raise exception if an unsupported model type is provided
+    raise AnalysisException(f"model_type {model_type} is not supported")
 
 
 def get_onnx_ops_list(onnx_model) -> Dict:
@@ -320,19 +324,19 @@ def analyze_onnx(build_name: str, cache_dir: str, stats: fs.Stats):
         onnx_model_info = populate_onnx_model_info(final_onnx_file)
         input_dimensions = onnx_input_dimensions(final_onnx_file)
 
-        stats.save_stat(
+        stats.save_model_stat(
             fs.Keys.ONNX_OPS_COUNTER,
             onnx_ops_counter,
         )
-        stats.save_stat(
+        stats.save_model_stat(
             fs.Keys.ONNX_TOTAL_FLOPS,
             onnx_total_flops,
         )
-        stats.save_stat(
+        stats.save_model_stat(
             fs.Keys.ONNX_MODEL_INFO,
             onnx_model_info,
         )
-        stats.save_stat(
+        stats.save_model_stat(
             fs.Keys.ONNX_INPUT_DIMENSIONS,
             input_dimensions,
         )

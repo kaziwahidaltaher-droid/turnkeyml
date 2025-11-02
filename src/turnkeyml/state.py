@@ -5,7 +5,6 @@ import yaml
 import turnkeyml.common.build as build
 import turnkeyml.common.filesystem as fs
 from turnkeyml.version import __version__ as turnkey_version
-from turnkeyml.memory_tracker import MemoryTracker
 
 
 def _is_nice_to_write(value):
@@ -81,7 +80,6 @@ class State:
         self.downcast_applied = False
         self.uid = build.unique_id()
         self.results = None
-        self.memory_tracker = MemoryTracker()
 
         # Store any additional kwargs as members
         for key, value in kwargs.items():
@@ -90,7 +88,6 @@ class State:
     def __setattr__(self, name: str, value: Any) -> None:
         """
         Tool developers can add a new member to State by simply
-        assigning it as an attribute, i.e., `state.new_member = value`.
         """
         return super().__setattr__(name, value)
 

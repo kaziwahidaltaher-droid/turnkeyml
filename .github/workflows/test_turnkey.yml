@@ -5,14 +5,9 @@ name: Lint and Test TurnkeyML
 
 on:
   push:
-    branches: ["main", "canary", "refresh"]
+    branches: ["main", "canary"]
   pull_request:
-    branches: ["main", "canary", "refresh"]
-    paths:
-    - src/turnkeyml/**
-    - test/turnkey/**
-    - examples/turnkey/**
-    - .github/workflows/test_turnkey.yml
+    branches: ["main", "canary"]
 
 permissions:
   contents: read
@@ -20,16 +15,17 @@ permissions:
 jobs:
   build-turnkey:
     env:
+      TURNKEY_VERBOSITY: static
       TURNKEY_TRACEBACK: True
     strategy:
       matrix:
-        python-version: ["3.8", "3.11"]
+        python-version: ["3.8", "3.10"]
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
       - name: Set up Miniconda with 64-bit Python
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@v2
         with:
           miniconda-version: "latest"
           activate-environment: tkml
@@ -38,49 +34,96 @@ jobs:
         shell: bash -el {0}
         run: |
           python -m pip install --upgrade pip
-          conda install pylint=3.2.7
+          conda install pylint
           pip install pytest
-          pip install -e plugins/devices
-          pip install -e . # Required to test current tkml package instead of pypi version
-          # tokenizers 0.20.4 seems to have an install bug, which we must avoid by limiting
-          # the transformers version
-          pip install "transformers<4.46.3" "tokenizers<0.20.4" timm
+          pip install -e .
+          pip install transformers timm
           python -m pip check
       - name: Lint with PyLint
         shell: bash -el {0}
         run: |
-          pylint src/turnkeyml --rcfile .pylintrc --ignore-paths src/turnkeyml/llm --jobs=1
-          pylint examples --rcfile .pylintrc --disable E0401,E0611 --jobs=1
+          pylint src/turnkeyml --rcfile .pylintrc
+          pylint examples --rcfile .pylintrc --ignore-paths examples/build_api --disable E0401,E0611
       - name: Test with unittest
         shell: bash -el {0}
         run: |
           # Unit tests
-          python test/turnkey/unit.py
+          python test/unit.py
 
           # turnkey examples
-          # Note: we clear the default cache location prior to each block of example runs
+          # Note: we clear the default cache location prior to each example run
           rm -rf ~/.cache/turnkey
-          python examples/turnkey/api/onnx_opset.py --onnx-opset 15
-          python examples/turnkey/api/loading_a_build.py
-
+          python examples/files_api/onnx_opset.py --onnx-opset 15
           rm -rf ~/.cache/turnkey
-          turnkey -i examples/turnkey/cli/scripts/hello_world.py discover export-pytorch benchmark
+          turnkey examples/cli/scripts/hello_world.py
           rm -rf ~/.cache/turnkey
-          turnkey -i examples/turnkey/cli/scripts/multiple_invocations.py discover export-pytorch benchmark
+          turnkey examples/cli/scripts/multiple_invocations.py
           rm -rf ~/.cache/turnkey
-          turnkey -i examples/turnkey/cli/scripts/max_depth.py discover --max-depth 1 export-pytorch benchmark
+          turnkey examples/cli/scripts/max_depth.py --max-depth 1
           rm -rf ~/.cache/turnkey
-          turnkey -i examples/turnkey/cli/scripts/two_models.py discover export-pytorch benchmark
+          turnkey examples/cli/scripts/two_models.py
           rm -rf ~/.cache/turnkey
-          turnkey -i examples/turnkey/cli/onnx/hello_world.onnx load-onnx benchmark
+          turnkey examples/cli/onnx/hello_world.onnx
 
           # E2E tests
-          cd test/turnkey
+          cd test/
           python cli.py
           python analysis.py
       - name: Test example plugins
         shell: bash -el {0}
         run: |
           rm -rf ~/.cache/turnkey
-          pip install -e examples/turnkey/cli/plugins/example_tool
-          turnkey -i examples/turnkey/cli/scripts/hello_world.py discover export-pytorch example-plugin-tool benchmark
+          pip install -e examples/cli/plugins/example_rt
+          turnkey examples/cli/scripts/hello_world.py --runtime example-rt
+
+          rm -rf ~/.cache/turnkey
+          pip install -e examples/cli/plugins/example_seq
+          turnkey examples/cli/scripts/hello_world.py --sequence example-seq
+
+          rm -rf ~/.cache/turnkey
+          pip install -e examples/cli/plugins/example_combined
+          turnkey examples/cli/scripts/hello_world.py --runtime example-combined-rt --rt-args delay_before_benchmarking::5
+          turnkey examples/cli/scripts/hello_world.py --device example_family::part1::config2
+          turnkey examples/cli/scripts/hello_world.py --device example_family::part1::config1
+          turnkey examples/cli/scripts/hello_world.py --device example_family::part1
+          turnkey examples/cli/scripts/hello_world.py --device example_family
+
+          # E2E tests
+          cd test
+          python plugins.py
+      - name: Install and Start Slurm
+        if: runner.os != 'Windows'
+        shell: bash -el {0}
+        run: |
+          sudo apt update -y
+          sudo apt install slurm-wlm -y
+          cp test/helpers/slurm.conf test/helpers/slurm_modified.conf
+          sed -i "s/YOUR_HOSTNAME_HERE/$HOSTNAME/" test/helpers/slurm_modified.conf
+          sudo mv test/helpers/slurm_modified.conf /etc/slurm/slurm.conf
+          sudo service slurmd start
+          sudo service slurmctld start
+          sudo service munge start
+      - name: Test turnkey on Slurm
+        if: runner.os != 'Windows'
+        shell: bash -el {0}
+        run: |
+          # Create conda environment for Slurm using srun (sbatch + wait)
+          export SKIP_REQUIREMENTS_INSTALL="True"
+          export TORCH_CPU="True"
+          srun src/turnkeyml/cli/setup_venv.sh
+
+          # Run tests on Slurm
+          export TURNKEY_SLURM_USE_DEFAULT_MEMORY="True"
+          turnkey benchmark models/selftest/linear.py --build-only --use-slurm --cache-dir local_cache
+          bash test/helpers/check_slurm_output.sh slurm-2.out
+
+      # Below tests are commented out as the GitHub runner runs out of space installing the requirements
+      # - name: Check installation of requirements.txt and their compatibility with turnkey
+      #   shell: bash -el {0}
+      #   run: |
+      #     conda create --name test-requirements python=3.8
+      #     conda activate test-requirements
+      #     pip install -r models/requirements.txt
+      #     python -m pip check
+      #     python -c "import torch_geometric"
+      #     conda deactivate

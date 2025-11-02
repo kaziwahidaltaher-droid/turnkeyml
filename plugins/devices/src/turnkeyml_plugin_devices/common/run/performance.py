@@ -162,6 +162,36 @@ def parse_device(
                 f"A previous tool set the device to {state.device}, "
                 f"however this tool ({tool_name}) "
                 f"is attempting to set device to {parsed_args.device}. "
+                "We suggest ommitting the `--device` argument from "
+                "this tool."
+            )
+
+        device_to_use = parsed_args.device
+
+    parsed_args.device = Device(device_to_use, supported_devices)
+
+
+def parse_device(
+    state: State,
+    parsed_args: argparse.Namespace,
+    default_device: str,
+    tool_name: str,
+    supported_devices=None,
+):
+    # Inherit the device from the state of a prior tool, if available
+    if parsed_args.device is None:
+        if vars(state).get("device") is None:
+            device_to_use = default_device
+        else:
+            device_to_use = state.device
+    else:
+        if vars(state).get("device") is not None and str(state.device) != str(
+            parsed_args.device
+        ):
+            raise exp.ArgError(
+                f"A previous tool set the device to {state.device}, "
+                f"however this tool ({tool_name}) "
+                f"is attempting to set device to {parsed_args.device}. "
                 "We suggest omitting the `--device` argument from "
                 "this tool."
             )
